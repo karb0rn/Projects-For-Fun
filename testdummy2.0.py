@@ -10,7 +10,7 @@ mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh()
 
 # Start webcam feed
-droidcam_url = "http://192.168.197.164:4747/video"
+droidcam_url = ""
 cap = cv2.VideoCapture(droidcam_url, cv2.CAP_FFMPEG)
 
 def eye_aspect_ratio(eye_landmarks):
