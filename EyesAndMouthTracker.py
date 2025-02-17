@@ -9,7 +9,7 @@ mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
 
 # Start webcam feed
-DROIDCAM_URL = "http://:4747/video"
+DROIDCAM_URL = ""
 cap = cv2.VideoCapture(DROIDCAM_URL, cv2.CAP_FFMPEG)
 
 # Thresholds
