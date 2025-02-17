@@ -5,6 +5,7 @@ import json
 VTS_WS_URL = "ws://localhost:8001"
 AUTH_TOKEN = "your_auth_token"
 
+
 async def send_to_vtube_studio(websocket, queue):
     """Send EAR and MAR data to VTube Studio."""
     while True:
@@ -28,6 +29,7 @@ async def send_to_vtube_studio(websocket, queue):
 
         except Exception as e:
             print(f"Error sending data to VTube Studio: {e}")
+
 
 async def connect_to_vtube_studio(queue):
     """Connect to VTube Studio via WebSocket and authenticate."""
@@ -57,4 +59,3 @@ async def connect_to_vtube_studio(queue):
 
     except Exception as e:
         print(f"WebSocket connection error: {e}")
-

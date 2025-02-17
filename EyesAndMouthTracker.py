@@ -2,18 +2,25 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import asyncio
+from collections import deque
 
 # Initialize MediaPipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
 
 # Start webcam feed
-droidcam_url = "http://192.168.197.164:4747/video"
-cap = cv2.VideoCapture(droidcam_url, cv2.CAP_FFMPEG)
+DROIDCAM_URL = "http://:4747/video"
+cap = cv2.VideoCapture(DROIDCAM_URL, cv2.CAP_FFMPEG)
 
 # Thresholds
 EAR_THRESHOLD = 0.22
 MAR_THRESHOLD = 0.4
+
+# Moving average window
+SMOOTHING_WINDOW = 5
+ears_left = deque(maxlen=SMOOTHING_WINDOW)
+ears_right = deque(maxlen=SMOOTHING_WINDOW)
+mars = deque(maxlen=SMOOTHING_WINDOW)
 
 def calculate_distance(landmark1, landmark2, width, height):
     """Calculate Euclidean distance between two landmarks in pixel coordinates."""
@@ -36,16 +43,29 @@ def mouth_aspect_ratio(mouth_landmarks, width, height):
 
 async def process_facial_tracking(queue):
     """Process video frames and compute EAR and MAR values."""
-    while cap.isOpened():
+    global cap
+    while True:
+        if not cap.isOpened():
+            print("Reconnecting to DroidCam...")
+            cap = cv2.VideoCapture(DROIDCAM_URL, cv2.CAP_FFMPEG)
+            await asyncio.sleep(1)
+            continue
+
         ret, frame = cap.read()
         if not ret:
             print("Failed to grab frame. Check your DroidCam connection.")
-            break
+            await asyncio.sleep(1)
+            continue
 
-        frame = cv2.resize(frame, (640, 480))
+        frame = cv2.resize(frame, (480, 360))  # Lower resolution for speed
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb_frame)
         width, height = frame.shape[1], frame.shape[0]
+
+        try:
+            results = face_mesh.process(rgb_frame)
+        except Exception as e:
+            print("Error processing frame:", e)
+            continue
 
         if results.multi_face_landmarks:
             for face_landmarks in results.multi_face_landmarks:
@@ -61,20 +81,30 @@ async def process_facial_tracking(queue):
                 right_ear = eye_aspect_ratio(right_eye_landmarks, width, height)
                 mar = mouth_aspect_ratio(mouth_landmarks, width, height)
 
+                # Apply moving average smoothing
+                ears_left.append(left_ear)
+                ears_right.append(right_ear)
+                mars.append(mar)
+                smooth_left_ear = np.mean(ears_left)
+                smooth_right_ear = np.mean(ears_right)
+                smooth_mar = np.mean(mars)
+
                 # Blink Detection
-                if left_ear < EAR_THRESHOLD and right_ear < EAR_THRESHOLD:
+                if smooth_left_ear < EAR_THRESHOLD and smooth_right_ear < EAR_THRESHOLD:
                     cv2.putText(frame, "Blink Detected!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
                 # Mouth Open Detection
-                if mar > MAR_THRESHOLD:
+                if smooth_mar > MAR_THRESHOLD:
                     cv2.putText(frame, "Mouth Open!", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
 
-                # Send data to WebSocket
-                await queue.put({"ear_left": left_ear, "ear_right": right_ear, "mar": mar})
+                # Send data to WebSocket queue
+                await queue.put({"ear_left": smooth_left_ear, "ear_right": smooth_right_ear, "mar": smooth_mar})
 
         cv2.imshow("Facial Landmarks", frame)
         if cv2.waitKey(1) & 0xFF == ord("q"):
             break
+
+        await asyncio.sleep(0.01)  # Non-blocking sleep for async handling
 
     cap.release()
     cv2.destroyAllWindows()
