@@ -4,145 +4,149 @@ import mediapipe as mp
 import asyncio
 import websockets
 import json
+import threading
+import tkinter as tk
 
-# Initialize MediaPipe Face Mesh
+# MediaPipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
-face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
+face_mesh = mp_face_mesh.FaceMesh()
 
-# Start webcam feed
-droidcam_url = "http://192.168.197.164:4747/video"
-cap = cv2.VideoCapture(droidcam_url, cv2.CAP_FFMPEG)
-
-def calculate_distance(landmark1, landmark2, width, height):
-    """
-    Calculate Euclidean distance between two facial landmarks.
-    Convert normalized coordinates (0-1) to pixel-based coordinates.
-    """
-    x1, y1 = int(landmark1.x * width), int(landmark1.y * height)
-    x2, y2 = int(landmark2.x * width), int(landmark2.y * height)
-    return np.linalg.norm([x2 - x1, y2 - y1])
-
-def eye_aspect_ratio(eye_landmarks, width, height):
-    """
-    Compute the Eye Aspect Ratio (EAR) to detect blinks.
-    """
-    vertical1 = calculate_distance(eye_landmarks[1], eye_landmarks[5], width, height)
-    vertical2 = calculate_distance(eye_landmarks[2], eye_landmarks[4], width, height)
-    horizontal = calculate_distance(eye_landmarks[0], eye_landmarks[3], width, height)
-    
-    if horizontal == 0:
-        return 0  # Avoid division by zero
-    return (vertical1 + vertical2) / (2.0 * horizontal)
-
-def mouth_aspect_ratio(mouth_landmarks, width, height):
-    """
-    Compute the Mouth Aspect Ratio (MAR) to detect mouth open status.
-    """
-    vertical = calculate_distance(mouth_landmarks[2], mouth_landmarks[3], width, height)
-    horizontal = calculate_distance(mouth_landmarks[0], mouth_landmarks[1], width, height)
-    
-    if horizontal == 0:
-        return 0  # Avoid division by zero
-    return vertical / horizontal
-
-# Thresholds
-EAR_THRESHOLD = 0.22  # Blink detection
-MAR_THRESHOLD = 0.4   # Mouth open detection
+# Constants for thresholds
+EAR_THRESHOLD = 0.2  # Blink threshold
+MAR_THRESHOLD = 0.5  # Mouth open threshold
+BROW_RAISE_THRESHOLD = 0.02  # Eyebrow raise threshold
+HEAD_TILT_THRESHOLD = 10  # Tilt angle threshold
 
 # WebSocket URL for VTube Studio
 VTS_WS_URL = "ws://localhost:8001"
 AUTH_TOKEN = "your_auth_token"
 
-async def send_to_vtube_studio(websocket, ear_left, ear_right, mar):
-    """Send EAR and MAR data to VTube Studio."""
-    try:
-        expression_data = {
-            "apiName": "VTubeStudioPublicAPI",
-            "apiVersion": "1.0",
-            "requestID": "ExpressionRequest",
-            "messageType": "ExpressionActivationRequest",
-            "data": {
-                "expressions": [
-                    {"id": "EyeLeftX", "value": ear_left},
-                    {"id": "EyeRightX", "value": ear_right},
-                    {"id": "MouthOpen", "value": mar}
-                ]
-            }
-        }
-        await websocket.send(json.dumps(expression_data))
-    except Exception as e:
-        print(f"Error sending data to VTube Studio: {e}")
+# DroidCam Stream URL
+droidcam_url = "http://192.168.197.164:4747/video"
 
-async def connect_to_vtube_studio():
-    """Connect to VTube Studio and process facial tracking data."""
-    try:
-        async with websockets.connect(VTS_WS_URL) as websocket:
-            print("Connected to VTube Studio!")
+class FaceTracker:
+    def _init_(self):
+        self.cap = cv2.VideoCapture(droidcam_url, cv2.CAP_FFMPEG)
+        self.frame_counter = 0
+        self.PROCESS_EVERY_N_FRAMES = 3  # Skip frames for optimization
+        self.websocket = None
 
-            # Authentication
-            if AUTH_TOKEN:
-                auth_message = {
-                    "apiName": "VTubeStudioPublicAPI",
-                    "apiVersion": "1.0",
-                    "requestID": "AuthRequest",
-                    "messageType": "AuthenticationRequest",
-                    "data": {
-                        "pluginName": "FacialTracker",
-                        "pluginDeveloper": "YourName",
-                        "authenticationToken": AUTH_TOKEN
-                    }
+        # Start WebSocket connection in a separate thread
+        threading.Thread(target=asyncio.run, args=(self.connect_to_vtube_studio(),), daemon=True).start()
+
+    def eye_aspect_ratio(self, eye_landmarks):
+        vertical1 = np.linalg.norm(np.array([eye_landmarks[1].x, eye_landmarks[1].y]) - np.array([eye_landmarks[0].x, eye_landmarks[0].y]))
+        vertical2 = np.linalg.norm(np.array([eye_landmarks[3].x, eye_landmarks[3].y]) - np.array([eye_landmarks[2].x, eye_landmarks[2].y]))
+        horizontal = np.linalg.norm(np.array([eye_landmarks[4].x, eye_landmarks[4].y]) - np.array([eye_landmarks[5].x, eye_landmarks[5].y]))
+        return 0 if horizontal == 0 else (vertical1 + vertical2) / (2.0 * horizontal)
+
+    def mouth_aspect_ratio(self, mouth_landmarks):
+        vertical = np.linalg.norm(np.array([mouth_landmarks[1].x, mouth_landmarks[1].y]) - np.array([mouth_landmarks[0].x, mouth_landmarks[0].y]))
+        horizontal = np.linalg.norm(np.array([mouth_landmarks[3].x, mouth_landmarks[3].y]) - np.array([mouth_landmarks[2].x, mouth_landmarks[2].y]))
+        return 0 if horizontal == 0 else vertical / horizontal
+
+    def head_tilt_angle(self, face_landmarks, width, height):
+        left_eye = face_landmarks.landmark[33]
+        right_eye = face_landmarks.landmark[263]
+        nose = face_landmarks.landmark[1]
+
+        eye_center_x = (left_eye.x + right_eye.x) / 2
+        eye_center_y = (left_eye.y + right_eye.y) / 2
+        angle = np.arctan2(nose.y - eye_center_y, nose.x - eye_center_x) * (180.0 / np.pi)
+
+        return angle
+
+    async def connect_to_vtube_studio(self):
+        while True:
+            try:
+                async with websockets.connect(VTS_WS_URL) as self.websocket:
+                    print("Connected to VTube Studio!")
+                    if AUTH_TOKEN:
+                        auth_message = {
+                            "apiName": "VTubeStudioPublicAPI",
+                            "apiVersion": "1.0",
+                            "requestID": "AuthRequest",
+                            "messageType": "AuthenticationRequest",
+                            "data": {
+                                "pluginName": "FacialTracker",
+                                "pluginDeveloper": "YourName",
+                                "authenticationToken": AUTH_TOKEN
+                            }
+                        }
+                        await self.websocket.send(json.dumps(auth_message))
+                        response = await self.websocket.recv()
+                        print("Authentication Response:", response)
+
+                    await self.process_video()
+
+            except Exception as e:
+                print(f"WebSocket Error: {e}, Reconnecting in 5 seconds...")
+                await asyncio.sleep(5)
+
+    async def send_to_vtube_studio(self, ear_left, ear_right, mar, head_tilt):
+        if not self.websocket:
+            return
+        try:
+            expression_data = {
+                "apiName": "VTubeStudioPublicAPI",
+                "apiVersion": "1.0",
+                "requestID": "ExpressionRequest",
+                "messageType": "ExpressionActivationRequest",
+                "data": {
+                    "expressions": [
+                        {"id": "EyeLeftX", "value": ear_left},
+                        {"id": "EyeRightX", "value": ear_right},
+                        {"id": "MouthOpen", "value": mar},
+                        {"id": "HeadTilt", "value": head_tilt}
+                    ]
                 }
-                await websocket.send(json.dumps(auth_message))
-                response = await websocket.recv()
-                print("Authentication Response:", response)
+            }
+            await self.websocket.send(json.dumps(expression_data))
+        except Exception as e:
+            print(f"Error sending data to VTube Studio: {e}")
 
-            while cap.isOpened():
-                ret, frame = cap.read()
-                if not ret:
-                    print("Failed to grab frame. Check your DroidCam connection.")
-                    break
+    async def process_video(self):
+        while self.cap.isOpened():
+            self.frame_counter += 1
+            ret, frame = self.cap.read()
+            if not ret or self.frame_counter % self.PROCESS_EVERY_N_FRAMES != 0:
+                continue
 
-                frame = cv2.resize(frame, (640, 480))
-                rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = face_mesh.process(rgb_frame)
-                width, height = frame.shape[1], frame.shape[0]
+            frame = cv2.resize(frame, (640, 480))
+            rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = face_mesh.process(rgb_frame)
 
-                if results.multi_face_landmarks:
-                    for face_landmarks in results.multi_face_landmarks:
-                        # Eye landmarks
-                        left_eye_indices = [33, 160, 158, 133, 153, 144]
-                        right_eye_indices = [362, 385, 386, 263, 373, 380]
-                        mouth_indices = [78, 308, 13, 14]  # Adjusted for better accuracy
+            if results.multi_face_landmarks:
+                for face_landmarks in results.multi_face_landmarks:
+                    left_eye = [face_landmarks.landmark[i] for i in [33, 160, 158, 133, 153, 144]]
+                    right_eye = [face_landmarks.landmark[i] for i in [362, 385, 386, 263, 373, 380]]
+                    mouth = [face_landmarks.landmark[i] for i in [61, 291, 0, 17, 40, 270]]
 
-                        left_eye_landmarks = [face_landmarks.landmark[i] for i in left_eye_indices]
-                        right_eye_landmarks = [face_landmarks.landmark[i] for i in right_eye_indices]
-                        mouth_landmarks = [face_landmarks.landmark[i] for i in mouth_indices]
+                    left_ear = self.eye_aspect_ratio(left_eye)
+                    right_ear = self.eye_aspect_ratio(right_eye)
+                    mar = self.mouth_aspect_ratio(mouth)
+                    head_tilt = self.head_tilt_angle(face_landmarks, frame.shape[1], frame.shape[0])
 
-                        # Calculate EAR and MAR
-                        left_ear = eye_aspect_ratio(left_eye_landmarks, width, height)
-                        right_ear = eye_aspect_ratio(right_eye_landmarks, width, height)
-                        mar = mouth_aspect_ratio(mouth_landmarks, width, height)
+                    print(f"EAR Left: {left_ear}, EAR Right: {right_ear}, MAR: {mar}, Head Tilt: {head_tilt}")
 
-                        # Blink Detection
-                        if left_ear < EAR_THRESHOLD and right_ear < EAR_THRESHOLD:
-                            cv2.putText(frame, "Blink Detected!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    if left_ear < EAR_THRESHOLD and right_ear < EAR_THRESHOLD:
+                        print("Blink detected!")
+                    if left_ear < EAR_THRESHOLD < right_ear:
+                        print("Left wink detected!")
+                    if right_ear < EAR_THRESHOLD < left_ear:
+                        print("Right wink detected!")
+                    if mar > MAR_THRESHOLD:
+                        print("Mouth Open!")
 
-                        # Mouth Open Detection
-                        if mar > MAR_THRESHOLD:
-                            cv2.putText(frame, "Mouth Open!", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                    await self.send_to_vtube_studio(left_ear, right_ear, mar, head_tilt)
 
-                        # Send data to VTube Studio
-                        await send_to_vtube_studio(websocket, left_ear, right_ear, mar)
+            cv2.imshow('Facial Tracking', frame)
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
-                cv2.imshow('Facial Landmarks', frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-    except Exception as e:
-        print(f"WebSocket connection error: {e}")
+        self.cap.release()
+        cv2.destroyAllWindows()
 
-# Run the WebSocket client
-asyncio.get_event_loop().run_until_complete(connect_to_vtube_studio())
-
-# Release resources
-cap.release()
-cv2.destroyAllWindows()
+if _name_ == "_main_":
+    tracker = FaceTracker()
+    asyncio.run(tracker.connect_to_vtube_studio())
