@@ -2,109 +2,141 @@ import cv2
 import numpy as np
 import mediapipe as mp
 import asyncio
-from collections import deque
+import websockets
+import json
+import time
+import threading
 
 # Initialize MediaPipe Face Mesh
 mp_face_mesh = mp.solutions.face_mesh
 face_mesh = mp_face_mesh.FaceMesh(static_image_mode=False, max_num_faces=1, refine_landmarks=True)
 
 # Start webcam feed
-DROIDCAM_URL = ""
+DROIDCAM_URL = "http://192.168.14.180:4747/video"
 cap = cv2.VideoCapture(DROIDCAM_URL, cv2.CAP_FFMPEG)
 
 # Thresholds
-EAR_THRESHOLD = 0.22
-MAR_THRESHOLD = 0.4
+EAR_THRESHOLD = 0.22  # Blink detection
+MAR_THRESHOLD = 0.4   # Mouth open detection
+VTS_WS_URL = "ws://localhost:8001"
+AUTH_TOKEN = "your_auth_token"
 
-# Moving average window
-SMOOTHING_WINDOW = 5
-ears_left = deque(maxlen=SMOOTHING_WINDOW)
-ears_right = deque(maxlen=SMOOTHING_WINDOW)
-mars = deque(maxlen=SMOOTHING_WINDOW)
+# FPS Calculation
+frame_count = 0
+start_time = time.time()
 
-def calculate_distance(landmark1, landmark2, width, height):
-    """Calculate Euclidean distance between two landmarks in pixel coordinates."""
-    x1, y1 = int(landmark1.x * width), int(landmark1.y * height)
-    x2, y2 = int(landmark2.x * width), int(landmark2.y * height)
-    return np.linalg.norm([x2 - x1, y2 - y1])
-
-def eye_aspect_ratio(eye_landmarks, width, height):
-    """Compute the Eye Aspect Ratio (EAR)."""
-    vertical1 = calculate_distance(eye_landmarks[1], eye_landmarks[5], width, height)
-    vertical2 = calculate_distance(eye_landmarks[2], eye_landmarks[4], width, height)
-    horizontal = calculate_distance(eye_landmarks[0], eye_landmarks[3], width, height)
-    return (vertical1 + vertical2) / (2.0 * horizontal) if horizontal != 0 else 0
-
-def mouth_aspect_ratio(mouth_landmarks, width, height):
-    """Compute the Mouth Aspect Ratio (MAR)."""
-    vertical = calculate_distance(mouth_landmarks[2], mouth_landmarks[3], width, height)
-    horizontal = calculate_distance(mouth_landmarks[0], mouth_landmarks[1], width, height)
-    return vertical / horizontal if horizontal != 0 else 0
-
-async def process_facial_tracking(queue):
-    """Process video frames and compute EAR and MAR values."""
-    global cap
+# WebSocket Connection
+async def websocket_task():
+    global ear_left, ear_right, mar
     while True:
-        if not cap.isOpened():
-            print("Reconnecting to DroidCam...")
-            cap = cv2.VideoCapture(DROIDCAM_URL, cv2.CAP_FFMPEG)
-            await asyncio.sleep(1)
-            continue
+        try:
+            async with websockets.connect(VTS_WS_URL) as websocket:
+                print("Connected to VTube Studio!")
+                
+                # Authenticate
+                auth_message = {
+                    "apiName": "VTubeStudioPublicAPI",
+                    "apiVersion": "1.0",
+                    "requestID": "AuthRequest",
+                    "messageType": "AuthenticationRequest",
+                    "data": {
+                        "pluginName": "FacialTracker",
+                        "pluginDeveloper": "YourName",
+                        "authenticationToken": AUTH_TOKEN
+                    }
+                }
+                await websocket.send(json.dumps(auth_message))
+                response = await websocket.recv()
+                print("Authentication Response:", response)
+                
+                while True:
+                    if ear_left is not None and ear_right is not None and mar is not None:
+                        expression_data = {
+                            "apiName": "VTubeStudioPublicAPI",
+                            "apiVersion": "1.0",
+                            "requestID": "ExpressionRequest",
+                            "messageType": "ExpressionActivationRequest",
+                            "data": {
+                                "expressions": [
+                                    {"id": "EyeLeftX", "value": ear_left},
+                                    {"id": "EyeRightX", "value": ear_right},
+                                    {"id": "MouthOpen", "value": mar}
+                                ]
+                            }
+                        }
+                        await websocket.send(json.dumps(expression_data))
+                    await asyncio.sleep(0.05)
+        except Exception as e:
+            print(f"WebSocket connection error: {e}, retrying in 3 seconds...")
+            await asyncio.sleep(3)
 
+# Start WebSocket in a separate thread
+def start_websocket():
+    asyncio.run(websocket_task())
+
+threading.Thread(target=start_websocket, daemon=True).start()
+
+def process_frames():
+    global ear_left, ear_right, mar, frame_count, start_time
+    while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
-            print("Failed to grab frame. Check your DroidCam connection.")
-            await asyncio.sleep(1)
-            continue
+            print("Failed to grab frame. Check DroidCam connection.")
+            break
 
-        frame = cv2.resize(frame, (480, 360))  # Lower resolution for speed
+        frame = cv2.resize(frame, (640, 480))
         rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results = face_mesh.process(rgb_frame)
         width, height = frame.shape[1], frame.shape[0]
-
-        try:
-            results = face_mesh.process(rgb_frame)
-        except Exception as e:
-            print("Error processing frame:", e)
-            continue
 
         if results.multi_face_landmarks:
             for face_landmarks in results.multi_face_landmarks:
                 left_eye_indices = [33, 160, 158, 133, 153, 144]
                 right_eye_indices = [362, 385, 386, 263, 373, 380]
                 mouth_indices = [78, 308, 13, 14]
-
+                
                 left_eye_landmarks = [face_landmarks.landmark[i] for i in left_eye_indices]
                 right_eye_landmarks = [face_landmarks.landmark[i] for i in right_eye_indices]
                 mouth_landmarks = [face_landmarks.landmark[i] for i in mouth_indices]
+                
+                def calculate_distance(landmark1, landmark2):
+                    x1, y1 = int(landmark1.x * width), int(landmark1.y * height)
+                    x2, y2 = int(landmark2.x * width), int(landmark2.y * height)
+                    return np.linalg.norm([x2 - x1, y2 - y1])
 
-                left_ear = eye_aspect_ratio(left_eye_landmarks, width, height)
-                right_ear = eye_aspect_ratio(right_eye_landmarks, width, height)
-                mar = mouth_aspect_ratio(mouth_landmarks, width, height)
+                def eye_aspect_ratio(eye_landmarks):
+                    vertical1 = calculate_distance(eye_landmarks[1], eye_landmarks[5])
+                    vertical2 = calculate_distance(eye_landmarks[2], eye_landmarks[4])
+                    horizontal = calculate_distance(eye_landmarks[0], eye_landmarks[3])
+                    return (vertical1 + vertical2) / (2.0 * horizontal) if horizontal else 0
 
-                # Apply moving average smoothing
-                ears_left.append(left_ear)
-                ears_right.append(right_ear)
-                mars.append(mar)
-                smooth_left_ear = np.mean(ears_left)
-                smooth_right_ear = np.mean(ears_right)
-                smooth_mar = np.mean(mars)
+                def mouth_aspect_ratio(mouth_landmarks):
+                    vertical = calculate_distance(mouth_landmarks[2], mouth_landmarks[3])
+                    horizontal = calculate_distance(mouth_landmarks[0], mouth_landmarks[1])
+                    return vertical / horizontal if horizontal else 0
 
-                # Blink Detection
-                if smooth_left_ear < EAR_THRESHOLD and smooth_right_ear < EAR_THRESHOLD:
+                ear_left = eye_aspect_ratio(left_eye_landmarks)
+                ear_right = eye_aspect_ratio(right_eye_landmarks)
+                mar = mouth_aspect_ratio(mouth_landmarks)
+
+                if ear_left < EAR_THRESHOLD and ear_right < EAR_THRESHOLD:
                     cv2.putText(frame, "Blink Detected!", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-
-                # Mouth Open Detection
-                if smooth_mar > MAR_THRESHOLD:
+                if mar > MAR_THRESHOLD:
                     cv2.putText(frame, "Mouth Open!", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                
+                cv2.putText(frame, f"EAR: {ear_left:.2f}, {ear_right:.2f}", (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                cv2.putText(frame, f"MAR: {mar:.2f}", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-                # Send data to WebSocket queue
-                await queue.put({"ear_left": smooth_left_ear, "ear_right": smooth_right_ear, "mar": smooth_mar})
+        frame_count += 1
+        elapsed_time = time.time() - start_time
+        fps = frame_count / elapsed_time
+        cv2.putText(frame, f"FPS: {fps:.2f}", (500, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
 
-        cv2.imshow("Facial Landmarks", frame)
-        if cv2.waitKey(1) & 0xFF == ord("q"):
+        cv2.imshow('Facial Landmarks', frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
             break
 
-        await asyncio.sleep(0.01)  # Non-blocking sleep for async handling
-
-    cap.release()
-    cv2.destroyAllWindows()
+# Start Frame Processing
+process_frames()
+cap.release()
+cv2.destroyAllWindows()
